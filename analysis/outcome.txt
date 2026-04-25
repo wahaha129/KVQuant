@@ -1,0 +1,362 @@
+outcome for cuda_kernel_coplexity:
+========================================================================
+KVQUANT ADVERSARIAL AUDIT — Vulnerability 1: CUDA Kernel Complexity
+========================================================================
+
+File: deployment/kvquant/quant_cuda_kernel.cu
+  Total source lines   : 5,668
+  Unique kernel names  : 32
+  Forward declarations : 64
+  atomicAdd calls      : 48
+  Trig calls (cos/sin/pow): 121
+
+  Kernel classification by axis:
+    bit_width           : 2=8, 3=8, 4=12
+    kv_target           : K=17, V=11, other=4
+    sparse              : Sparse=20, Dense=12
+    rope                : Rope=5, NoRope=27
+    parallel            : Parallel=12, Sequential=20
+    orig_variant        : Orig=4, Opt=6, other=22
+
+  Theoretical combinatorial maximum: 216 variants
+  Actual implemented variants      : 32
+  Coverage ratio                   : 14.8% (incomplete cross-product; adding a new feature requires N new kernels)
+
+File: benchmarking/kvquant/quant_cuda_kernel.cu
+  Total source lines   : 1,254
+  Unique kernel names  : 8
+  Forward declarations : 16
+  atomicAdd calls      : 12
+  Trig calls (cos/sin/pow): 4
+
+  Kernel classification by axis:
+    bit_width           : 4=6
+    kv_target           : K=4, V=2, other=2
+    sparse              : Sparse=6, Dense=2
+    rope                : Rope=2, NoRope=6
+    parallel            : Parallel=2, Sequential=6
+    orig_variant        : Opt=2, other=6
+
+  Theoretical combinatorial maximum: 48 variants
+  Actual implemented variants      : 8
+  Coverage ratio                   : 16.7% (incomplete cross-product; adding a new feature requires N new kernels)
+------------------------------------------------------------------------
+
+RoPE Trigonometric Recomputation Analysis (deployment kernel):
+  trig_ops_per_int32_word (manual count): 16
+  words_per_BLOCKWIDTH_row: 16
+  trig_ops_per_row (manual): 256
+  trig_ops_in_fused_kernel_body: 116
+  note: Each int32 packs 8 × 4-bit values; the decode loop calls cosf()+sinf() once per value — 16 trig calls per word, 256 per 128-channel row. No precomputed sine table is used (unlike standard RoPE implementations).
+========================================================================
+
+Summary of Findings:
+
+1. The deployment kernel file alone contains 5,668 lines of hand-written CUDA
+   across 32 unique kernel functions, spanning 6 independent axes of variation
+   (bit-width, K/V, sparse/dense, RoPE, parallel/sequential, orig/opt).
+
+2. The kernel set is an INCOMPLETE cross-product: adding a single new axis
+   (e.g., a 1-bit quantization mode) requires implementing up to 32 new
+   kernels, each requiring manual register-blocking and shared-memory tuning.
+
+3. atomicAdd is used 48 times inside inner loops. On CUDA compute
+   capability < 9.0, global atomicAdd on fp32 is not cached; each call
+   serialises threads and stalls the GPU pipeline.
+
+4. cosf/sinf/powf transcendental functions are recomputed INSIDE the inner
+   decoding loop rather than precomputed into a table. This adds O(seqlen)
+   transcendental evaluations per query head per token generated.
+
+========================================================================
+
+
+outcome for dequantization_memory.py:
+========================================================================
+KVQUANT ADVERSARIAL AUDIT — Vulnerability 3: Dequantization Bottleneck
+========================================================================
+
+Table 1: LUT Shared-Memory Allocation and SM Occupancy (4-bit NUQ)
+  A100 SM resources: 164 KB shared mem, 32 KB L1 cache, 2048 max threads
+
+         Model |  SharedMem/blk(KB) |  Blocks/SM |  Occupancy | SMEM used% |  GlobalLUT(KB) | Fits L1?
+  ----------------------------------------------------------------------------------------------------
+      LLaMA-7B |                9.5 |         16 |     100.0% |      92.7% |          262.1 |       NO
+     LLaMA-13B |                9.5 |         16 |     100.0% |      92.7% |          327.7 |       NO
+     LLaMA-65B |                9.5 |         16 |     100.0% |      92.7% |          524.3 |       NO
+
+Table 2: Arithmetic Intensity — fp16 baseline vs NUQ-4bit + RoPE inline
+  (LLaMA-7B, head_dim=128, TRIG_FLOP_EQUIV=20 FLOPs per transcendental)
+
+      SeqLen |  fp16 (FLOP/B) |   NUQ-4+RoPE |  BW saving |   Trig overhead
+  -------------------------------------------------------------------------
+       1,000 |           1.00 |        74.47 |        4.0× |           95.2%
+      10,000 |           1.00 |        82.94 |        4.0× |           95.2%
+     100,000 |           1.00 |        83.89 |        4.0× |           95.2%
+   1,000,000 |           1.00 |        83.99 |        4.0× |           95.2%
+
+Table 3: Transcendental function calls per token generated (Q*K^T)
+  (No precomputed sine/cosine table; recomputed per-element per query)
+
+        SeqLen |    Trig evals (LLaMA-7B) |     Trig evals (LLaMA-65B)
+  --------------------------------------------------------------------
+        10,000 |            2,621,440,000 |             13,107,200,000
+       100,000 |           26,214,400,000 |            131,072,000,000
+       500,000 |          131,072,000,000 |            655,360,000,000
+     1,000,000 |          262,144,000,000 |          1,310,720,000,000
+------------------------------------------------------------------------
+
+Verified code paths in deployment/kvquant/quant_cuda_kernel.cu:
+
+  Line 3067 (VecQuant4MatMulKernelNUQPerChannelTransposedRopeMHABatchedFusedOpt):
+    __shared__ float deq2[17][BLOCKWIDTH];  // 17×128×4 = 8 704 B / block
+    for (int val = 0; val < 16; val++) {
+        deq2[val][off] = lookup_table[lut_index];  // 16 global→shared loads
+    }
+    deq2[16][off] = powf(rope_theta, ...);  // RoPE theta precompute (shared)
+
+  Lines 3125-3199 (inner decode loop, unrolled 8× per int32):
+    c = cosf(theta * pos);   // transcendental — per decoded element
+    s = sinf(theta * pos);   // transcendental — per decoded element
+    res += tmp1 * c * blockvec[k];
+    res += sign * tmp1 * s * blockvec2[k];
+
+========================================================================
+
+Summary of Findings:
+
+1. The fused NUQ+RoPE kernel allocates 9.5 KB of shared memory per thread
+   block for the LUT (8.7 KB) plus input vectors (0.8 KB).  On an A100 with
+   2048 max threads per SM, occupancy is thread-limited (not shared-mem
+   limited), reaching 100%.  However, the LUT consumes 93% of the per-block
+   shared memory allocation, leaving almost no headroom for register spilling
+   or future kernel features without sacrificing occupancy.
+
+2. The full per-layer LUT (256 KB for LLaMA-7B at 4-bit) is 8× larger than
+   the A100 L1 cache (32 KB per SM).  Each attention block must re-load the
+   LUT from L2/global memory on every block launch, causing repeated L2 cache
+   pressure that negates part of the bandwidth saving from 4-bit packing.
+
+3. cosf() and sinf() are called inline per decoded 4-bit element rather than
+   precomputed into a table.  At 1M-token context, this produces over
+   2.6 × 10^11 transcendental evaluations per token for LLaMA-7B —
+   a compute cost that the paper does not report separately.
+
+4. The net arithmetic intensity of NUQ-4+RoPE is NOT simply 4× higher than
+   fp16: the trig overhead contributes >95% of the total FLOP count at long
+   contexts, making the kernel severely compute-bound rather than bandwidth-
+   bound and effectively eroding the memory-bandwidth-reduction argument.
+
+========================================================================
+
+
+outcome for pipeline_integration_compexity:
+========================================================================
+KVQUANT ADVERSARIAL AUDIT — Vulnerability 4: Integration Complexity
+========================================================================
+
+Table 1: User-Facing Hyperparameters Across the KVQuant Pipeline
+
+    # |              Parameter |           Type |                Stage | Description
+  --------------------------------------------------------------------------------------------------------
+    1 |                   bits |            int |   quant + deployment | Number of quantization bits (2/3/4/5)
+    2 |         include_sparse |           bool |   quant + deployment | Enable dense-and-sparse quantization
+    3 |     sparsity_threshold |          float |   quant + deployment | Percentile threshold for outlier detection (e.g. 0.999)
+    4 |           cap_outliers |           bool |   quant + deployment | Cap to fixed num outliers per token (needed for efficient kernels)
+    5 |                    nuq |           bool |   quant + deployment | Enable Non-Uniform Quantization (NUQ)
+    6 |                 nf_nuq |           bool |   quant + deployment | Use NormalFloat signposts instead of KMeans
+    7 |                   norm |           bool |   quant + deployment | Enable Q-Norm post-quantization normalisation
+    8 |         first_few_fp16 |            int |   quant + deployment | Keep first N tokens in fp16 (attention sink)
+    9 |           include_rope |           bool |                quant | Apply pre-RoPE key quantization
+   10 |             perchannel |           bool |   quant + deployment | Per-channel (key) vs per-token (value) quantization axis
+   11 |                 n_init |            str |                quant | KMeans initialisation strategy ("auto" or integer)
+   12 |               max_iter |            int |                quant | KMeans max iterations (default: 50)
+   13 |           random_state |            int |                quant | KMeans random seed
+   14 |                 fisher |    bool/tensor |    gradients + quant | Whether to use Fisher-weighted KMeans
+   15 |                 seqlen |            int |                quant | Calibration sequence length
+   16 |              maxseqlen |            int |           deployment | Maximum inference sequence length (pre-allocates KV buffer)
+   17 |      use_parallel_topk |           bool |           deployment | Use GPU parallel topK for sparse outlier packing
+   18 |                  model |            str |           all stages | HuggingFace model path or ID
+   19 |                dataset |            str |                quant | Calibration dataset (e.g. wikitext2, c4)
+   20 |               nsamples |            int |                quant | Number of calibration samples
+
+  Total: 20 non-trivial hyperparameters
+  Note: Many combinations are invalid (e.g. nf_nuq=True with nuq=False, or cap_outliers without include_sparse). No validation layer exists.
+
+Pipeline Dependency Graph:
+
+  Stage 1: [gradients/]  Fisher Information Computation
+    Environment : Custom conda env with modified Hugging Face Transformers fork
+    Inputs      : Pretrained model weights, Calibration dataset
+    Outputs     : fisher_info_*.pt  (one file per layer)
+    Blocking    : YES (must complete before next stage)
+    ⚠  The gradients/ folder IS a fork of the entire HuggingFace transformers repository (see gradients/src/transformers/).
+    ⚠  Must be re-run whenever the model changes or a new calibration set is used.
+    ⚠  Fisher info files can be hundreds of GB for large models.
+
+  Stage 2: [quant/]  Calibration & Codebook Fitting
+    Environment : Separate conda env with sklearn, scipy
+    Inputs      : Pretrained model, fisher_info_*.pt, Calibration dataset
+    Outputs     : quantizers.pickle  (per-layer LUT + thresholds)
+    Blocking    : YES (must complete before next stage)
+    ⚠  KMeans is run on the CPU for every (layer, channel) pair.
+    ⚠  No validation that codebook quality is acceptable before proceeding.
+    ⚠  quantizers.pickle can fail to load in deployment if path is wrong (binary pickle, not a portable format).
+
+  Stage 3: [deployment/]  CUDA Extension Build + Inference
+    Environment : Third conda env; must compile quant_cuda extension
+    Inputs      : quantizers.pickle, CUDA-capable GPU, torch C++ headers
+    Outputs     : Quantized model inference
+    Blocking    : NO
+    ⚠  Compilation of quant_cuda_kernel.cu (5,668 lines) takes 3-10 minutes.
+    ⚠  Compiled extension is NOT portable: tied to CUDA toolkit + PyTorch version.
+    ⚠  A mismatch in PyTorch ABI between conda env and compiled .so causes silent corruption or segfault.
+    ⚠  maxseqlen must be set at startup; changing it requires model reload.
+
+  Stage 4: [benchmarking/]  Kernel Benchmarking (Optional)
+    Environment : Fourth conda env; separate CUDA extension compilation
+    Inputs      : activations-seqlen*.pickle, quantizers.pickle
+    Outputs     : Timing tables
+    Blocking    : NO
+    ⚠  Requires pre-cached activations (separate data collection step).
+    ⚠  Uses a different, simpler CUDA kernel file (1,254 lines) that is NOT identical to the deployment kernels.
+------------------------------------------------------------------------
+
+Table 2: KMeans Calibration Cost Estimates
+
+         Model |   KMeans calls |  Est. time (h) |  Calib data (GB)
+  -----------------------------------------------------------------
+      LLaMA-7B |        131,104 |           0.76 |            274.9
+     LLaMA-13B |        204,840 |           1.19 |            429.5
+     LLaMA-65B |        655,440 |           3.82 |           1374.4
+
+Table 3: Silent Failure Modes (no exception raised)
+
+  Failure 1:
+    Condition : cap_outliers=True but include_sparse=False
+    Symptom   : cap_outliers code path in get_outliers() runs topK selection but the resulting mask is never used; model runs without error but produces fp16-equivalent output (no compression).
+    Source    : quant/kvquant/simquant_module_quantizer.py:56-73
+
+  Failure 2:
+    Condition : maxseqlen too small for actual input
+    Symptom   : KV cache buffer overflows silently; kernel writes out-of-bounds into the packed int32 tensor (fullwidth is the hard limit). No bounds check in CUDA kernels.
+    Source    : deployment/kvquant/quant_cuda_kernel.cu:709 (fullwidth parameter)
+
+  Failure 3:
+    Condition : Fisher info not available (fisher=None in KMeans call)
+    Symptom   : Falls back to uniform KMeans without Fisher weighting. No warning; perplexity degrades silently. Paper results depend on Fisher weighting.
+    Source    : quant/kvquant/simquant_module_quantizer.py:508-528
+
+  Failure 4:
+    Condition : quantizers.pickle generated with different bits than deployment
+    Symptom   : LUT has wrong number of entries; kernel loop 'for val in 0..15' reads uninitialized memory. No version check in pickle.
+    Source    : deployment/kvquant/simquant_module_quantizer.py:618
+
+  Failure 5:
+    Condition : KMeans converges to <2^bits clusters (degenerate data distribution)
+    Symptom   : cluster_centers_ has fewer entries than expected; LUT is padded with zeros; quantization error spikes. sklearn does not raise an error for partial convergence.
+    Source    : quant/kvquant/simquant_module_quantizer.py:510-528
+
+========================================================================
+
+Summary of Findings:
+
+1. The KVQuant pipeline requires at least 3 separate conda environments with
+   incompatible dependencies.  Stage 1 uses a 70,000+ file fork of the entire
+   Hugging Face Transformers library just to intercept gradient computations.
+
+2. There are 20 user-facing hyperparameters that interact in undocumented
+   ways.  Several combinations (e.g. cap_outliers without include_sparse) silently
+   produce incorrect behavior rather than raising an error.
+
+3. KMeans codebook fitting requires up to 655440 separate CPU KMeans calls
+   for large models, and must be re-run entirely when the calibration set or
+   quantization bit-width changes.
+
+4. The paper's claimed A100 deployment requires compiling a 5,668-line CUDA
+   extension tied to a specific CUDA toolkit and PyTorch ABI.  There is no
+   pre-built wheel; any environment mismatch causes a silent segfault or
+   corrupted output.
+
+5. The benchmarking/ and deployment/ folders contain DIFFERENT CUDA source
+   files (1,254 vs 5,668 lines).  Benchmark results from the simpler kernel
+   may not reflect actual deployment performance.
+
+========================================================================
+
+
+outcome for sparse_integration_complexity:
+========================================================================
+KVQUANT ADVERSARIAL AUDIT — Vulnerability 2: Dense-and-Sparse Overhead
+========================================================================
+
+Table 1: Memory (GB) vs. Context Length — Baseline fp16 vs. KVQuant
+  (Model: LLaMA-7B, 32 layers, 32 heads, head_dim=128, bits=4)
+  Outlier rate: 0.2%
+
+      SeqLen |    fp16 (GB) |   KVQuant (GB) |   Overhead |     Outliers
+  ----------------------------------------------------------------------
+       1,000 |        0.524 |          0.151 |      0.29x |        8,192
+      10,000 |        5.243 |          1.364 |      0.26x |       81,920
+     100,000 |       52.429 |         13.485 |      0.26x |      819,200
+     250,000 |      131.072 |         33.688 |      0.26x |    2,048,000
+     500,000 |      262.144 |         67.358 |      0.26x |    4,096,000
+   1,000,000 |      524.288 |        134.700 |      0.26x |    8,192,000
+
+Table 2: Per-token append overhead (µs) due to dense-and-sparse mechanism
+  (For a single model layer; scale ×32 for full model)
+
+      SeqLen |  ExtraKernel(µs) |  CPUsync(µs) |  CatCopy(µs) |  Total(µs)
+  ------------------------------------------------------------------------
+       1,000 |              2.0 |          5.0 |        0.025 |      7.025
+      10,000 |              2.0 |          5.0 |        0.246 |      7.246
+     100,000 |              2.0 |          5.0 |        2.458 |      9.458
+     500,000 |              2.0 |          5.0 |       12.288 |     19.288
+   1,000,000 |              2.0 |          5.0 |       24.576 |     31.576
+
+Table 3: Cumulative append overhead (seconds) to build the KV cache
+  (Per layer × 32 layers for full model)
+
+     MaxSeqLen |  Per-layer (s) |  Full model (s)
+  -----------------------------------------------
+        10,000 |          0.071 |           2.279
+       100,000 |          0.823 |          26.336
+       500,000 |          6.575 |         210.402
+     1,000,000 |         19.300 |         617.609
+------------------------------------------------------------------------
+
+Critical code paths verified in deployment/kvquant/quant_cuda_kernel.cu:
+
+  Line 745-748 (vecquant4appendvecKsparseorig_cuda):
+    torch::Tensor hostcount = outlier_count.to(torch::kCPU);  // << SYNC BARRIER
+    int* count = hostcount.data_ptr<int>();
+    ...allocate dst_indices and dst_values based on intcount...
+    VecQuant4AppendVecKSparse2Orig<<<...>>>(...);  // << SECOND KERNEL
+
+  Lines 796-809 (sparse COO growth via torch::cat):
+    row2 = torch::cat({row, dst_row_cuda}, 0);
+    col2 = torch::cat({col, dst_indices},  0);  // copies ENTIRE history
+    val2 = torch::cat({val, dst_values},   0);
+
+========================================================================
+
+Summary of Findings:
+
+1. Every new KV token triggers a mandatory GPU-to-CPU synchronization to
+   read the dynamic outlier count.  This stalls the GPU pipeline and prevents
+   asynchronous execution, contradicting the paper's implicit assumption of
+   "efficient" online quantization.
+
+2. The sparse COO arrays are grown via torch::cat(), which copies ALL prior
+   outlier data on every token.  At 1M-token context and 0.2% outlier rate,
+   this cumulative copy cost reaches O(seqlen²) total bytes transferred.
+
+3. The two-phase kernel design (quantize → sync → scatter) doubles the number
+   of CUDA kernel launches compared to a single-pass approach, increasing
+   driver-overhead and reducing GPU occupancy at short sequence lengths.
+
+4. The paper reports memory savings (up to 12× at 4-bit) but does not report
+   the wall-clock latency cost of building the sparse KV cache during prefill,
+   which can exceed several seconds at 1M context even on an A100.
+
+========================================================================
